@@ -13,6 +13,7 @@ dependencies = [
   "packaging>=24.0",
   "modelscope>=1.18.0",
   "huggingface_hub>=0.24.0",
+  "sentence-transformers>=5.4.0",
 ]
 
 [tool.comfy]

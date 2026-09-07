@@ -93,10 +93,15 @@ runtime:
   offline_only: true                  # Fully offline default
 
 datasets:
-  root: "../IAT-datasets"
-  embedding_model_path: "models/embeddings/chinese-clip-vit-base-patch16"
-  embedding_device: "cpu"             # cpu / cuda / auto
-  embedding_batch_size: 16
+  root: "IAT-datasets"
+  embedding_model_path: "../../models/embeddings/Qwen3-VL-Embedding-2B"
+  embedding_provider: "qwen3_vl"       # auto / qwen3_vl / chinese_clip
+  embedding_device: "cuda"             # cpu / cuda / auto
+  embedding_batch_size: 1
+  embedding_dimension: 2048
+  embedding_query_instruction: "Retrieve automotive CMF training samples that best match the user's text or reference image."
+  embedding_document_instruction: "Represent an automotive CMF training sample for retrieval."
+  embedding_keep_loaded: false
   index_cache_dir: ""
 
 llm:
@@ -126,6 +131,35 @@ openai:
 logging:
   verbose: false                      # Enable verbose logging
 ```
+
+To compile one dataset or a dataset root into portable SQLite bundles, drag the
+folder onto `build_iatdb.cmd`. Each image group becomes one chunk; generated
+`.iatdb` files contain captions and normalized text/RGB/grayscale vectors, but no
+source images. Each chunk also stores the derived `full_cabin`,
+`color_material`, or `detail` sample type. A valid compiled bundle takes
+precedence over a colocated source directory with the same `dataset_name`.
+
+The Dataset RAG generator accepts an optional `cmf_request_json` input. Use it
+when colors and materials come from a UI; RGB/HEX values are locked, names are
+filled deterministically and cached, the model suggests only component
+assignments, and the final prompt is rendered by a fixed CMF template. Exact
+HEX/RGB values and factual color descriptors are used for conditioning;
+decorative names are metadata only. The planner also enforces material
+coverage across compatible components. Its
+`auxiliary_color_strategy` dropdown/JSON field supports `reuse_secondary`,
+`dataset`, `style`, and `none`; `none` is the production default and JSON
+explicitly set by the frontend wins over the node dropdown.
+
+When materials are supplied, retrieval reserves the best available reference
+for each requested material and keeps a complete-cabin sample when `top_k`
+allows it. The fixed planner uses seven regions, including seat bolsters and
+the front center-console trim, so material coverage does not depend on the
+language model remembering every material. `CMF Color Reference Image（IAT）`
+creates an exact RGB swatch image that can be sent to a downstream color
+reference input; the generator debug JSON also records the recommended
+Depth/Lineart controls and post-generation color/material/geometry checks.
+`CMF Region Color Acceptance（IAT）` accepts one generated image and one
+region MASK, then reports masked mean RGB and CIEDE2000 against a target HEX.
 
 For secrets such as API keys, you can write them directly into `config.yaml`:
 

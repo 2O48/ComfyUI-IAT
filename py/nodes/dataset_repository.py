@@ -9,11 +9,31 @@ captions, relative paths, metadata, and optional normalized embeddings only.
 import hashlib
 import json
 import math
+import os
 import random
 import re
+import sqlite3
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+
+from .embedding_adapters import (
+    EmbeddingAdapterError,
+    detect_embedding_provider,
+    embedding_model_signature,
+    get_embedding_adapter,
+    unload_embedding_adapters,
+)
+from .cmf_prompt import (
+    SAMPLE_CLASSIFICATION_VERSION,
+    SAMPLE_TYPES,
+    classify_caption,
+    extract_components,
+    extract_materials,
+    normalize_family,
+    normalize_material,
+)
 
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
@@ -27,7 +47,10 @@ _EXPLORATION_PROFILES = {
     "Medium": {"candidate_k": 16, "relevance": 0.65, "diversity": 0.35, "sampling_temperature": 0.20},
     "Strong": {"candidate_k": 16, "relevance": 0.50, "diversity": 0.50, "sampling_temperature": 0.32},
 }
-_EMBEDDING_MODELS: Dict[Tuple[str, str], Tuple[Any, Any]] = {}
+_BUNDLE_SCHEMA_VERSION = 2
+_BUNDLE_FORMAT = "comfyui-iat-dataset"
+_INDEX_SCHEMA_VERSION = 5
+_QWEN_IMAGE_MAX_SIDE = 768
 
 
 class DatasetError(RuntimeError):
@@ -46,6 +69,12 @@ class DatasetEntry:
     relative_image_path: str = ""
     image_paths: Dict[str, Path] = field(default_factory=dict)
     relative_image_paths: Dict[str, str] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def sample_types(self) -> List[str]:
+        values = self.metadata.get("sample_types")
+        return [str(value) for value in values] if isinstance(values, list) else []
 
     def grouped_image_paths(self) -> Dict[str, Path]:
         if self.image_paths:
@@ -74,6 +103,10 @@ class DatasetRecord:
     source_path: Path
     warnings: List[str] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
+    bundle_path: Optional[Path] = None
+    bundled_text_embeddings: List[Optional[List[float]]] = field(default_factory=list, repr=False)
+    bundled_image_embeddings: List[Optional[List[float]]] = field(default_factory=list, repr=False)
+    bundled_gray_embeddings: List[Optional[List[float]]] = field(default_factory=list, repr=False)
 
     @property
     def captions(self) -> List[str]:
@@ -126,6 +159,42 @@ def _required_string(raw: Dict[str, Any], field_name: str, path: Path) -> str:
     if not isinstance(value, str) or not value.strip():
         raise DatasetError(f"[IAT] {path.name}: `{field_name}` must be a non-empty string.")
     return _normalize_whitespace(value)
+
+
+def _optional_string(raw: Dict[str, Any], field_name: str, path: Path, default: str = "") -> str:
+    value = raw.get(field_name, default)
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise DatasetError(f"[IAT] {path.name}: `{field_name}` must be a string when provided.")
+    return _normalize_whitespace(value)
+
+
+def _optional_enum_list(
+    raw: Dict[str, Any],
+    field_name: str,
+    path: Path,
+    allowed: Sequence[str],
+) -> List[str]:
+    value = raw.get(field_name)
+    if value is None:
+        return []
+    values = _string_list(value, field_name, path, required=False)
+    normalized = [item.casefold() for item in values]
+    invalid = [item for item in normalized if item not in set(allowed)]
+    if invalid:
+        raise DatasetError(
+            f"[IAT] {path.name}: `{field_name}` contains unsupported values: {', '.join(invalid)}."
+        )
+    return list(dict.fromkeys(normalized))
+
+
+def _sample_metadata(caption: str) -> Dict[str, Any]:
+    return {
+        "sample_types": classify_caption(caption),
+        "materials": extract_materials(caption),
+        "components": extract_components(caption),
+    }
 
 
 def _caption_path_for_image(image_path: Path) -> Optional[Path]:
@@ -202,6 +271,7 @@ def _make_entry(
         relative_image_path=relative_paths.get(primary_role, ""),
         image_paths=dict(sorted(image_paths.items())),
         relative_image_paths=relative_paths,
+        metadata=_sample_metadata(caption),
     )
 
 
@@ -292,6 +362,30 @@ def load_dataset_record(path: Path) -> DatasetRecord:
     if language not in {"zh", "en", "ja"}:
         raise DatasetError(f"[IAT] {source_path.name}: `language` must be one of zh, en, or ja.")
     trigger_words = _string_list(raw.get("trigger_words"), "trigger_words", source_path, required=True)
+    dataset_kind = _optional_string(raw, "dataset_kind", source_path, "cmf") or "cmf"
+    style_id = _optional_string(raw, "style_id", source_path)
+    scope = (_optional_string(raw, "scope", source_path, "full_cabin") or "full_cabin").casefold()
+    if scope not in set(SAMPLE_TYPES):
+        raise DatasetError(f"[IAT] {source_path.name}: `scope` must be one of {', '.join(SAMPLE_TYPES)}.")
+    declared_sample_types = _optional_enum_list(raw, "sample_types", source_path, SAMPLE_TYPES)
+    supported_material_values = _string_list(raw.get("supported_materials"), "supported_materials", source_path)
+    supported_materials: List[str] = []
+    for value in supported_material_values:
+        normalized_material = normalize_material(value)
+        if normalized_material is None:
+            raise DatasetError(f"[IAT] {source_path.name}: unsupported material `{value}`.")
+        if normalized_material not in supported_materials:
+            supported_materials.append(normalized_material)
+    supported_color_values = _string_list(
+        raw.get("supported_color_families"), "supported_color_families", source_path
+    )
+    supported_color_families: List[str] = []
+    for value in supported_color_values:
+        normalized_family = normalize_family(value)
+        if normalized_family is None:
+            raise DatasetError(f"[IAT] {source_path.name}: unsupported color family `{value}`.")
+        if normalized_family not in supported_color_families:
+            supported_color_families.append(normalized_family)
     configured_roles = _string_list(raw.get("image_roles"), "image_roles", source_path, required=False)
     if configured_roles:
         configured_roles = [role.casefold() for role in configured_roles]
@@ -313,6 +407,11 @@ def load_dataset_record(path: Path) -> DatasetRecord:
     if not entries:
         raise DatasetError(f"[IAT] Dataset `{dataset_name}` has no valid image/caption entries.")
 
+    entry_type_counts: Dict[str, int] = {}
+    for entry in entries:
+        for sample_type in entry.sample_types:
+            entry_type_counts[sample_type] = entry_type_counts.get(sample_type, 0) + 1
+    derived_sample_types = sorted(set(entry_type_counts) | set(declared_sample_types))
     metadata = {
         "dataset_name": dataset_name,
         "version": version,
@@ -320,6 +419,15 @@ def load_dataset_record(path: Path) -> DatasetRecord:
         "lora_name": lora_name,
         "language": language,
         "trigger_words": trigger_words,
+        "dataset_kind": dataset_kind,
+        "style_id": style_id,
+        "scope": scope,
+        "sample_types": derived_sample_types,
+        "sample_classification_version": SAMPLE_CLASSIFICATION_VERSION,
+        "declared_sample_types": declared_sample_types,
+        "sample_type_counts": entry_type_counts,
+        "supported_materials": supported_materials,
+        "supported_color_families": supported_color_families,
         "image_roles": configured_roles,
         "caption_role": caption_role,
         "entry_count": len(entries),
@@ -338,6 +446,337 @@ def load_dataset_record(path: Path) -> DatasetRecord:
         warnings=warnings,
         metadata=metadata,
     )
+
+
+def _vector_to_blob(vector: Sequence[float]) -> bytes:
+    import numpy as np
+
+    values = np.asarray(vector, dtype="<f4")
+    if values.ndim != 1 or values.size == 0 or not np.isfinite(values).all():
+        raise DatasetError("[IAT] Cannot store an empty or non-finite embedding vector.")
+    return values.tobytes(order="C")
+
+
+def _vector_from_blob(value: bytes, dimension: int, label: str) -> List[float]:
+    import numpy as np
+
+    if not isinstance(value, bytes) or len(value) != dimension * 4:
+        raise DatasetError(f"[IAT] Compiled dataset has an invalid {label} vector payload.")
+    vector = np.frombuffer(value, dtype="<f4")
+    if vector.size != dimension or not np.isfinite(vector).all():
+        raise DatasetError(f"[IAT] Compiled dataset has an invalid {label} vector.")
+    norm = float(np.linalg.norm(vector))
+    if norm < 1e-6:
+        raise DatasetError(f"[IAT] Compiled dataset has a zero-length {label} vector.")
+    return (vector / norm).tolist()
+
+
+def _read_bundle_metadata(connection: sqlite3.Connection, path: Path) -> Dict[str, Any]:
+    try:
+        rows = connection.execute("SELECT key, value FROM metadata").fetchall()
+    except sqlite3.Error as exc:
+        raise DatasetError(f"[IAT] Compiled dataset `{path}` is missing its metadata table: {exc}") from exc
+    metadata: Dict[str, Any] = {}
+    for key, value in rows:
+        try:
+            metadata[str(key)] = json.loads(value)
+        except Exception as exc:
+            raise DatasetError(f"[IAT] Compiled dataset `{path}` has invalid metadata `{key}`: {exc}") from exc
+    if metadata.get("format") != _BUNDLE_FORMAT or metadata.get("schema_version") != _BUNDLE_SCHEMA_VERSION:
+        raise DatasetError(
+            f"[IAT] Unsupported compiled dataset format/schema in `{path}`: "
+            f"{metadata.get('format')!r}/{metadata.get('schema_version')!r}."
+        )
+    return metadata
+
+
+def load_dataset_bundle(path: Path) -> DatasetRecord:
+    path = Path(path).resolve()
+    if not path.is_file() or path.suffix.lower() != ".iatdb":
+        raise DatasetError(f"[IAT] Compiled dataset must be an existing .iatdb file: `{path}`")
+    try:
+        connection = sqlite3.connect(f"{path.as_uri()}?mode=ro", uri=True)
+    except sqlite3.Error as exc:
+        raise DatasetError(f"[IAT] Could not open compiled dataset `{path}`: {exc}") from exc
+    try:
+        integrity = connection.execute("PRAGMA quick_check").fetchone()
+        if not integrity or integrity[0] != "ok":
+            raise DatasetError(f"[IAT] Compiled dataset `{path}` failed SQLite integrity check: {integrity}")
+        metadata = _read_bundle_metadata(connection, path)
+        dimension = int(metadata.get("embedding_dimension") or 0)
+        if dimension <= 0:
+            raise DatasetError(f"[IAT] Compiled dataset `{path}` has an invalid embedding dimension.")
+        try:
+            rows = connection.execute(
+                "SELECT ordinal, record_id, caption, entry_metadata, text_embedding, image_embedding, gray_embedding "
+                "FROM chunks ORDER BY ordinal"
+            ).fetchall()
+        except sqlite3.Error as exc:
+            raise DatasetError(f"[IAT] Compiled dataset `{path}` is missing its chunks table: {exc}") from exc
+    finally:
+        connection.close()
+
+    expected_count = int(metadata.get("entry_count") or 0)
+    if not rows or len(rows) != expected_count:
+        raise DatasetError(
+            f"[IAT] Compiled dataset `{path}` expected {expected_count} chunks but contains {len(rows)}."
+        )
+    entries: List[DatasetEntry] = []
+    text_embeddings: List[Optional[List[float]]] = []
+    image_embeddings: List[Optional[List[float]]] = []
+    gray_embeddings: List[Optional[List[float]]] = []
+    seen_ids = set()
+    for expected_ordinal, row in enumerate(rows):
+        ordinal, record_id, caption, entry_metadata_blob, text_blob, image_blob, gray_blob = row
+        if ordinal != expected_ordinal:
+            raise DatasetError(f"[IAT] Compiled dataset `{path}` has non-contiguous chunk ordinals.")
+        if not isinstance(record_id, str) or not record_id.strip() or record_id in seen_ids:
+            raise DatasetError(f"[IAT] Compiled dataset `{path}` has an empty or duplicate record_id.")
+        if not isinstance(caption, str) or not caption.strip():
+            raise DatasetError(f"[IAT] Compiled dataset `{path}` has an empty caption for `{record_id}`.")
+        try:
+            entry_metadata = json.loads(entry_metadata_blob)
+        except Exception as exc:
+            raise DatasetError(f"[IAT] Compiled dataset `{path}` has invalid metadata for `{record_id}`: {exc}") from exc
+        if not isinstance(entry_metadata, dict):
+            raise DatasetError(f"[IAT] Compiled dataset `{path}` has non-object metadata for `{record_id}`.")
+        sample_types = entry_metadata.get("sample_types")
+        if not isinstance(sample_types, list) or not sample_types or any(
+            str(value) not in SAMPLE_TYPES for value in sample_types
+        ):
+            raise DatasetError(f"[IAT] Compiled dataset `{path}` has invalid sample types for `{record_id}`.")
+        seen_ids.add(record_id)
+        entries.append(
+            DatasetEntry(
+                record_id=record_id,
+                caption=_normalize_whitespace(caption),
+                metadata={
+                    **entry_metadata,
+                    "sample_types": list(dict.fromkeys(str(value) for value in sample_types)),
+                    "materials": [
+                        str(value) for value in entry_metadata.get("materials", [])
+                        if isinstance(value, str) and value.strip()
+                    ],
+                    "components": [
+                        str(value) for value in entry_metadata.get("components", [])
+                        if isinstance(value, str) and value.strip()
+                    ],
+                },
+            )
+        )
+        text_embeddings.append(_vector_from_blob(text_blob, dimension, "text"))
+        image_embeddings.append(_vector_from_blob(image_blob, dimension, "image"))
+        gray_embeddings.append(_vector_from_blob(gray_blob, dimension, "grayscale image"))
+
+    record_metadata = {
+        "dataset_name": _required_string(metadata, "dataset_name", path),
+        "version": _required_string(metadata, "version", path),
+        "base_model": _required_string(metadata, "base_model", path),
+        "lora_name": _required_string(metadata, "lora_name", path),
+        "language": _required_string(metadata, "language", path).lower(),
+        "trigger_words": _string_list(metadata.get("trigger_words"), "trigger_words", path, required=True),
+        "dataset_kind": str(metadata.get("dataset_kind") or "cmf"),
+        "style_id": str(metadata.get("style_id") or ""),
+        "scope": str(metadata.get("scope") or "full_cabin"),
+        "sample_types": list(metadata.get("sample_types") or []),
+        "sample_classification_version": int(metadata.get("sample_classification_version") or 1),
+        "declared_sample_types": list(metadata.get("declared_sample_types") or []),
+        "sample_type_counts": dict(metadata.get("sample_type_counts") or {}),
+        "supported_materials": list(metadata.get("supported_materials") or []),
+        "supported_color_families": list(metadata.get("supported_color_families") or []),
+        "entry_count": len(entries),
+        "source_path": str(path),
+        "compiled": True,
+        "embedding_provider": str(metadata.get("embedding_provider") or ""),
+        "embedding_dimension": dimension,
+        "embedding_model_signature": str(metadata.get("embedding_model_signature") or ""),
+        "embedding_query_instruction": str(metadata.get("embedding_query_instruction") or ""),
+        "embedding_document_instruction": str(metadata.get("embedding_document_instruction") or ""),
+        "source_fingerprint": str(metadata.get("source_fingerprint") or ""),
+        "warnings": [],
+    }
+    if record_metadata["language"] not in {"zh", "en", "ja"}:
+        raise DatasetError(f"[IAT] Compiled dataset `{path}` has an unsupported language.")
+    return DatasetRecord(
+        dataset_name=record_metadata["dataset_name"],
+        version=record_metadata["version"],
+        base_model=record_metadata["base_model"],
+        lora_name=record_metadata["lora_name"],
+        language=record_metadata["language"],
+        trigger_words=record_metadata["trigger_words"],
+        entries=entries,
+        source_path=path,
+        warnings=[],
+        metadata=record_metadata,
+        bundle_path=path,
+        bundled_text_embeddings=text_embeddings,
+        bundled_image_embeddings=image_embeddings,
+        bundled_gray_embeddings=gray_embeddings,
+    )
+
+
+def dataset_bundle_is_current(index: "DatasetIndex", output_path: Path) -> bool:
+    output_path = Path(output_path)
+    if not output_path.is_file():
+        return False
+    try:
+        connection = sqlite3.connect(f"{output_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            metadata = _read_bundle_metadata(connection, output_path)
+        finally:
+            connection.close()
+    except Exception:
+        return False
+    expected_dimension = len(index.text_embeddings[0]) if index.text_embeddings else 0
+    return all(
+        (
+            metadata.get("source_fingerprint") == index.fingerprint,
+            metadata.get("embedding_provider") == index.embedding_provider,
+            metadata.get("embedding_model_signature") == index.model_signature,
+            int(metadata.get("embedding_dimension") or 0) == expected_dimension,
+            metadata.get("embedding_query_instruction") == index.query_instruction,
+            metadata.get("embedding_document_instruction") == index.document_instruction,
+            int(metadata.get("sample_classification_version") or 0) == SAMPLE_CLASSIFICATION_VERSION,
+            int(metadata.get("entry_count") or 0) == len(index.record.entries),
+        )
+    )
+
+
+def dataset_bundle_matches_source(
+    record: DatasetRecord,
+    output_path: Path,
+    model_path: str,
+    provider: str,
+    dimension: int,
+    query_instruction: str,
+    document_instruction: str,
+) -> bool:
+    output_path = Path(output_path)
+    if not output_path.is_file():
+        return False
+    try:
+        resolved_provider = detect_embedding_provider(model_path, provider)
+        signature = embedding_model_signature(model_path, resolved_provider)
+        source_fingerprint = dataset_fingerprint(record)
+        connection = sqlite3.connect(f"{output_path.resolve().as_uri()}?mode=ro", uri=True)
+        try:
+            metadata = _read_bundle_metadata(connection, output_path)
+        finally:
+            connection.close()
+    except Exception:
+        return False
+    stored_dimension = int(metadata.get("embedding_dimension") or 0)
+    return all(
+        (
+            metadata.get("dataset_name") == record.dataset_name,
+            metadata.get("source_fingerprint") == source_fingerprint,
+            metadata.get("embedding_provider") == resolved_provider,
+            metadata.get("embedding_model_signature") == signature,
+            not dimension or stored_dimension == int(dimension),
+            metadata.get("embedding_query_instruction") == query_instruction,
+            metadata.get("embedding_document_instruction") == document_instruction,
+            int(metadata.get("sample_classification_version") or 0) == SAMPLE_CLASSIFICATION_VERSION,
+            int(metadata.get("entry_count") or 0) == len(record.entries),
+        )
+    )
+
+
+def write_dataset_bundle(index: "DatasetIndex", output_path: Path) -> Path:
+    output_path = Path(output_path).resolve()
+    entries = index.record.entries
+    vector_sets = (index.text_embeddings, index.image_embeddings, index.gray_embeddings)
+    if not entries or any(len(vectors) != len(entries) for vectors in vector_sets):
+        raise DatasetError("[IAT] A compiled dataset requires complete text, image, and grayscale vectors.")
+    if any(vector is None for vectors in vector_sets for vector in vectors):
+        raise DatasetError("[IAT] A compiled dataset cannot contain missing vectors.")
+    dimension = len(index.text_embeddings[0] or [])
+    if dimension <= 0 or any(len(vector or []) != dimension for vectors in vector_sets for vector in vectors):
+        raise DatasetError("[IAT] A compiled dataset requires one consistent non-zero embedding dimension.")
+    if not index.model_signature or not index.embedding_provider:
+        raise DatasetError("[IAT] A compiled dataset requires a resolved embedding model identity.")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temp_name = tempfile.mkstemp(prefix=f".{output_path.name}.", suffix=".tmp", dir=output_path.parent)
+    os.close(descriptor)
+    temp_path = Path(temp_name)
+    metadata = {
+        "format": _BUNDLE_FORMAT,
+        "schema_version": _BUNDLE_SCHEMA_VERSION,
+        "dataset_name": index.record.dataset_name,
+        "version": index.record.version,
+        "base_model": index.record.base_model,
+        "lora_name": index.record.lora_name,
+        "language": index.record.language,
+        "trigger_words": index.record.trigger_words,
+        "entry_count": len(entries),
+        "source_fingerprint": index.fingerprint,
+        "embedding_provider": index.embedding_provider,
+        "embedding_dimension": dimension,
+        "embedding_model_signature": index.model_signature,
+        "embedding_query_instruction": index.query_instruction,
+        "embedding_document_instruction": index.document_instruction,
+    }
+    for key in (
+        "dataset_kind",
+        "style_id",
+        "scope",
+        "sample_types",
+        "sample_classification_version",
+        "declared_sample_types",
+        "sample_type_counts",
+        "supported_materials",
+        "supported_color_families",
+    ):
+        if key in index.record.metadata:
+            metadata[key] = index.record.metadata[key]
+    try:
+        connection = sqlite3.connect(str(temp_path))
+        try:
+            connection.execute("PRAGMA journal_mode=DELETE")
+            connection.execute("PRAGMA synchronous=FULL")
+            connection.execute("CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            connection.execute(
+                "CREATE TABLE chunks ("
+                "ordinal INTEGER PRIMARY KEY, record_id TEXT NOT NULL UNIQUE, caption TEXT NOT NULL, "
+                "entry_metadata TEXT NOT NULL, "
+                "text_embedding BLOB NOT NULL, image_embedding BLOB NOT NULL, gray_embedding BLOB NOT NULL)"
+            )
+            connection.executemany(
+                "INSERT INTO metadata(key, value) VALUES (?, ?)",
+                [(key, json.dumps(value, ensure_ascii=False, separators=(",", ":"))) for key, value in metadata.items()],
+            )
+            connection.executemany(
+                "INSERT INTO chunks(ordinal, record_id, caption, entry_metadata, text_embedding, image_embedding, gray_embedding) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        ordinal,
+                        entry.record_id,
+                        entry.caption,
+                        json.dumps(
+                            entry.metadata or _sample_metadata(entry.caption),
+                            ensure_ascii=False,
+                            separators=(",", ":"),
+                        ),
+                        _vector_to_blob(index.text_embeddings[ordinal] or []),
+                        _vector_to_blob(index.image_embeddings[ordinal] or []),
+                        _vector_to_blob(index.gray_embeddings[ordinal] or []),
+                    )
+                    for ordinal, entry in enumerate(entries)
+                ],
+            )
+            connection.execute(f"PRAGMA user_version={_BUNDLE_SCHEMA_VERSION}")
+            connection.commit()
+            integrity = connection.execute("PRAGMA integrity_check").fetchone()
+            if not integrity or integrity[0] != "ok":
+                raise DatasetError(f"[IAT] New compiled dataset failed integrity check: {integrity}")
+        finally:
+            connection.close()
+        os.replace(temp_path, output_path)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return output_path
 
 
 def discover_datasets(root: Path) -> Tuple[Dict[str, DatasetRecord], List[str]]:
@@ -374,6 +813,31 @@ def discover_datasets(root: Path) -> Tuple[Dict[str, DatasetRecord], List[str]]:
             continue
         records[record.dataset_name] = record
 
+    bundle_records: Dict[str, DatasetRecord] = {}
+    duplicate_bundle_names = set()
+    for bundle_path in sorted(root.rglob("*.iatdb"), key=lambda path: path.as_posix().lower()):
+        try:
+            bundle_record = load_dataset_bundle(bundle_path)
+        except Exception as exc:
+            errors.append(str(exc))
+            continue
+        name = bundle_record.dataset_name
+        if name in duplicate_bundle_names:
+            errors.append(f"[IAT] Duplicate compiled dataset_name `{name}` in `{bundle_path}`.")
+            continue
+        if name in bundle_records:
+            errors.append(
+                f"[IAT] Duplicate compiled dataset_name `{name}` in "
+                f"`{bundle_records[name].source_path}` and `{bundle_path}`."
+            )
+            bundle_records.pop(name, None)
+            duplicate_bundle_names.add(name)
+            continue
+        bundle_records[name] = bundle_record
+
+    # A compiled bundle is the portable runtime artifact and intentionally takes
+    # precedence over its colocated authoring directory.
+    records.update(bundle_records)
     return records, errors
 
 
@@ -393,6 +857,14 @@ def dataset_fingerprint(record: DatasetRecord) -> str:
     # Hash content rather than mtimes so the same dataset version remains stable
     # after a touch/copy operation while still invalidating changed image bytes.
     digest = hashlib.sha256()
+    if record.bundle_path is not None:
+        try:
+            with record.bundle_path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+        except OSError as exc:
+            raise DatasetError(f"[IAT] Could not read compiled dataset `{record.bundle_path}`: {exc}") from exc
+        return digest.hexdigest()
     dataset_dir = record.source_path.parent
     digest.update(record.source_path.name.encode("utf-8"))
     digest.update(record.source_path.read_bytes())
@@ -417,7 +889,10 @@ def dataset_fingerprint(record: DatasetRecord) -> str:
 
 
 def _safe_name(value: str) -> str:
-    return re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "dataset"
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._") or "dataset"
+    if safe != value:
+        safe = f"{safe}-{hashlib.sha256(value.encode('utf-8')).hexdigest()[:12]}"
+    return safe
 
 
 def _cosine(left: Optional[Sequence[float]], right: Optional[Sequence[float]]) -> float:
@@ -489,6 +964,12 @@ class DatasetIndex:
         gray_embeddings: Optional[List[Optional[List[float]]]] = None,
         embedding_model_path: str = "",
         embedding_device: str = "cpu",
+        embedding_provider: str = "auto",
+        embedding_batch_size: int = 1,
+        embedding_dimension: int = 0,
+        query_instruction: str = "",
+        document_instruction: str = "",
+        model_signature: str = "",
         warnings: Optional[List[str]] = None,
     ):
         self.record = record
@@ -498,6 +979,12 @@ class DatasetIndex:
         self.gray_embeddings = gray_embeddings or []
         self.embedding_model_path = embedding_model_path
         self.embedding_device = embedding_device
+        self.embedding_provider = embedding_provider
+        self.embedding_batch_size = max(1, int(embedding_batch_size))
+        self.embedding_dimension = max(0, int(embedding_dimension))
+        self.query_instruction = query_instruction
+        self.document_instruction = document_instruction
+        self.model_signature = model_signature
         self.warnings = list(warnings or [])
         self.tokens = [tokenize(entry.caption) for entry in record.entries]
         self.document_frequency: Dict[str, int] = {}
@@ -507,7 +994,7 @@ class DatasetIndex:
 
     @property
     def version(self) -> str:
-        return f"hybrid-v3:{self.fingerprint[:12]}"
+        return f"hybrid-v5:{self.fingerprint[:12]}"
 
     def _bm25_scores(self, query: str) -> List[float]:
         query_tokens = tokenize(query)
@@ -543,6 +1030,63 @@ class DatasetIndex:
         left_tokens, right_tokens = set(self.tokens[left]), set(self.tokens[right])
         return len(left_tokens & right_tokens) / max(len(left_tokens | right_tokens), 1)
 
+    def _entry_materials(self, index: int) -> List[str]:
+        entry = self.record.entries[index]
+        values = entry.metadata.get("materials") if isinstance(entry.metadata, dict) else None
+        if not isinstance(values, list) or not values:
+            values = extract_materials(entry.caption)
+        normalized: List[str] = []
+        for value in values:
+            material = normalize_material(value)
+            if material and material not in normalized:
+                normalized.append(material)
+        return normalized
+
+    def _material_coverage_indices(
+        self,
+        ranked_candidates: Sequence[int],
+        required_materials: Sequence[str],
+    ) -> Tuple[List[int], Dict[str, List[str]]]:
+        """Reserve the best available sample for each requested material.
+
+        The semantic rank remains the primary ordering signal.  This only
+        prevents a heavily represented material from consuming the entire
+        small reference set.
+        """
+        normalized = []
+        for value in required_materials:
+            material = normalize_material(value)
+            if material and material not in normalized:
+                normalized.append(material)
+        if not normalized:
+            return [], {}
+
+        candidates_by_material: Dict[str, List[int]] = {material: [] for material in normalized}
+        for index in ranked_candidates:
+            entry_materials = set(self._entry_materials(index))
+            for material in normalized:
+                if material in entry_materials:
+                    candidates_by_material[material].append(index)
+
+        reserved: List[int] = []
+        for material in normalized:
+            material_candidates = candidates_by_material[material]
+            preferred = [
+                index for index in material_candidates
+                if "full_cabin" not in (
+                    self.record.entries[index].sample_types
+                    or classify_caption(self.record.entries[index].caption)
+                )
+            ]
+            for index in preferred + material_candidates:
+                if index not in reserved:
+                    reserved.append(index)
+                    break
+        return reserved, {
+            material: [self.record.entries[index].record_id for index in indexes[:3]]
+            for material, indexes in candidates_by_material.items()
+        }
+
     def retrieve(
         self,
         query: str,
@@ -553,6 +1097,7 @@ class DatasetIndex:
         candidate_k: int = 16,
         seed: int = 0,
         exploration_strength: str = "Medium",
+        required_materials: Optional[Sequence[str]] = None,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         top_k = max(1, min(8, int(top_k)))
         exploration_name, profile = _exploration_profile(exploration_strength)
@@ -562,7 +1107,15 @@ class DatasetIndex:
             references.insert(0, reference_image)
         bm25 = self._bm25_scores(query)
         text_query = (
-            _encode_text(self.embedding_model_path, query, device=self.embedding_device)
+            _encode_text(
+                self.embedding_model_path,
+                query,
+                device=self.embedding_device,
+                provider=self.embedding_provider,
+                batch_size=self.embedding_batch_size,
+                dimension=self.embedding_dimension,
+                instruction=self.query_instruction,
+            )
             if self.embedding_model_path
             else None
         )
@@ -574,6 +1127,10 @@ class DatasetIndex:
                     references[0],
                     grayscale=not preserve_reference_color,
                     device=self.embedding_device,
+                    provider=self.embedding_provider,
+                    batch_size=self.embedding_batch_size,
+                    dimension=self.embedding_dimension,
+                    instruction=self.query_instruction,
                 )
             else:
                 image_query = _mean_vector(
@@ -581,8 +1138,11 @@ class DatasetIndex:
                         self.embedding_model_path,
                         references,
                         self.embedding_device,
-                        min(16, len(references)),
+                        min(self.embedding_batch_size, len(references)),
                         grayscale=not preserve_reference_color,
+                        provider=self.embedding_provider,
+                        dimension=self.embedding_dimension,
+                        instruction=self.query_instruction,
                     )
                 )
 
@@ -617,7 +1177,36 @@ class DatasetIndex:
         candidates = ranked_candidates[:candidate_k]
         candidate_pool = list(candidates)
 
+        material_reserved, material_candidates = self._material_coverage_indices(
+            ranked_candidates,
+            required_materials or (),
+        )
         selected: List[int] = []
+        # Keep one complete-cabin reference when there is room after reserving
+        # material examples.  Detail/color-material samples then complement it.
+        if material_reserved and len(material_reserved) < top_k:
+            full_cabin = next(
+                (
+                    index for index in ranked_candidates
+                    if "full_cabin" in (
+                        self.record.entries[index].sample_types
+                        or classify_caption(self.record.entries[index].caption)
+                    )
+                    and index not in material_reserved
+                ),
+                None,
+            )
+            if full_cabin is None and str(self.record.metadata.get("scope") or "").casefold() == "full_cabin":
+                # Some legacy CMF captions describe only the palette while the
+                # dataset metadata still guarantees full-cabin result images.
+                full_cabin = next(
+                    (index for index in ranked_candidates if index not in material_reserved),
+                    None,
+                )
+            if full_cabin is not None:
+                material_reserved.append(full_cabin)
+        selected.extend(material_reserved[:top_k])
+        candidates = [index for index in candidates if index not in selected]
         while candidates and len(selected) < top_k:
             utilities = [
                 profile["relevance"] * combined[idx]
@@ -647,6 +1236,10 @@ class DatasetIndex:
                     "image_path": entry.relative_image_path,
                     "image_paths": entry.grouped_relative_image_paths(),
                     "image_roles": list(entry.grouped_relative_image_paths()),
+                    "sample_types": entry.sample_types,
+                    "entry_metadata": dict(entry.metadata),
+                    "material_tags": self._entry_materials(idx),
+                    "component_tags": list(entry.metadata.get("components") or []),
                     "score": round(float(combined[idx]), 6),
                     "components": {
                         "bm25": round(float(normalized_bm25[idx]), 6),
@@ -659,6 +1252,8 @@ class DatasetIndex:
         debug = {
             "index_version": self.version,
             "embedding_model_path": self.embedding_model_path,
+            "embedding_provider": self.embedding_provider,
+            "embedding_dimension": self.embedding_dimension,
             "embedding_device": self.embedding_device,
             "reference_image_used": bool(references),
             "reference_image_count": len(references),
@@ -673,6 +1268,28 @@ class DatasetIndex:
             "sampling_temperature": profile["sampling_temperature"],
             "selection_method": "seeded_weighted_mmr",
             "ranking_source": "hybrid_score_then_seeded_mmr",
+            "material_coverage": {
+                "requested": [
+                    normalize_material(value) for value in (required_materials or ())
+                    if normalize_material(value)
+                ],
+                "reserved_record_ids": [self.record.entries[index].record_id for index in material_reserved],
+                "candidate_record_ids": material_candidates,
+                "used": sorted({
+                    material
+                    for index in selected
+                    for material in self._entry_materials(index)
+                }),
+                "missing": sorted({
+                    normalize_material(value)
+                    for value in (required_materials or ())
+                    if normalize_material(value)
+                } - {
+                    material
+                    for index in selected
+                    for material in self._entry_materials(index)
+                }),
+            },
             "candidate_pool": [
                 {
                     "candidate_rank": rank,
@@ -711,100 +1328,91 @@ def _resolve_embedding_device(device: str) -> str:
         raise EmbeddingModelUnavailable(f"[IAT] Could not resolve embedding device: {exc}") from exc
 
 
-def _load_embedding_model(model_path: str, device: str = "cpu"):
-    normalized = str(Path(model_path).expanduser())
-    if not normalized:
+def _load_embedding_model(
+    model_path: str,
+    device: str = "cpu",
+    batch_size: int = 1,
+    provider: str = "auto",
+    dimension: int = 0,
+):
+    if not str(model_path or "").strip():
         raise EmbeddingModelUnavailable("[IAT] Embedding model path is not configured.")
-    resolved_device = _resolve_embedding_device(device)
-    cache_key = (normalized, resolved_device)
-    if cache_key in _EMBEDDING_MODELS:
-        return _EMBEDDING_MODELS[cache_key]
-    path = Path(normalized)
-    if not path.is_dir():
-        raise EmbeddingModelUnavailable(f"[IAT] Local embedding model does not exist: `{path}`")
     try:
-        import torch
-        from transformers import ChineseCLIPModel, ChineseCLIPProcessor
-
-        processor = ChineseCLIPProcessor.from_pretrained(str(path), local_files_only=True)
-        model = ChineseCLIPModel.from_pretrained(str(path), local_files_only=True)
-        model.eval()
-        model.to(resolved_device)
-    except Exception as exc:
-        raise EmbeddingModelUnavailable(
-            f"[IAT] Failed to load local Chinese CLIP embedding model `{path}` without downloading: {exc}"
-        ) from exc
-    _EMBEDDING_MODELS[cache_key] = (processor, model)
-    return processor, model
+        return get_embedding_adapter(
+            model_path,
+            _resolve_embedding_device(device),
+            batch_size,
+            provider=provider,
+            dimension=dimension,
+        )
+    except EmbeddingAdapterError as exc:
+        raise EmbeddingModelUnavailable(f"[IAT] {exc}") from exc
 
 
-def _as_float_list(tensor: Any) -> List[float]:
-    values = tensor.detach().float().cpu()
-    norm = values.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-12)
-    return (values / norm)[0].tolist()
-
-
-def _as_float_lists(tensor: Any) -> List[List[float]]:
-    values = tensor.detach().float().cpu()
-    norm = values.norm(p=2, dim=-1, keepdim=True).clamp_min(1e-12)
-    return (values / norm).tolist()
-
-
-def _move_inputs(inputs: Dict[str, Any], device: str) -> Dict[str, Any]:
-    return {key: value.to(device) if hasattr(value, "to") else value for key, value in inputs.items()}
-
-
-def _encode_text(model_path: str, text: str, device: str = "cpu") -> Optional[List[float]]:
+def _encode_text(
+    model_path: str,
+    text: str,
+    device: str = "cpu",
+    provider: str = "auto",
+    batch_size: int = 1,
+    dimension: int = 0,
+    instruction: str = "",
+) -> Optional[List[float]]:
     if not text:
         return None
     try:
-        import torch
-        resolved_device = _resolve_embedding_device(device)
-        processor, model = _load_embedding_model(model_path, resolved_device)
-        inputs = _move_inputs(processor(text=[text], padding=True, return_tensors="pt"), resolved_device)
-        with torch.inference_mode():
-            features = model.get_text_features(**inputs)
-        return _as_float_list(features)
-    except EmbeddingModelUnavailable:
-        raise
-    except Exception as exc:
+        adapter = _load_embedding_model(model_path, device, batch_size, provider, dimension)
+        return adapter.encode_texts([text], instruction=instruction)[0]
+    except (EmbeddingModelUnavailable, EmbeddingAdapterError) as exc:
         raise EmbeddingModelUnavailable(f"[IAT] Failed to encode text with local embedding model: {exc}") from exc
 
 
-def _encode_image(model_path: str, image: Any, grayscale: bool = True, device: str = "cpu") -> Optional[List[float]]:
+def _encode_image(
+    model_path: str,
+    image: Any,
+    grayscale: bool = True,
+    device: str = "cpu",
+    provider: str = "auto",
+    batch_size: int = 1,
+    dimension: int = 0,
+    instruction: str = "",
+) -> Optional[List[float]]:
     if image is None:
         return None
     try:
-        import torch
         from PIL import Image
 
         if not isinstance(image, Image.Image):
             raise TypeError("reference image must be a PIL image")
-        prepared = image.convert("L").convert("RGB") if grayscale else image.convert("RGB")
-        resolved_device = _resolve_embedding_device(device)
-        processor, model = _load_embedding_model(model_path, resolved_device)
-        inputs = _move_inputs(processor(images=[prepared], return_tensors="pt"), resolved_device)
-        with torch.inference_mode():
-            features = model.get_image_features(**inputs)
-        return _as_float_list(features)
-    except EmbeddingModelUnavailable:
-        raise
-    except Exception as exc:
+        prepared = image.convert("RGB")
+        if provider == "qwen3_vl" and max(prepared.size) > _QWEN_IMAGE_MAX_SIDE:
+            scale = _QWEN_IMAGE_MAX_SIDE / max(prepared.size)
+            prepared = prepared.resize(
+                (max(1, round(prepared.width * scale)), max(1, round(prepared.height * scale))),
+                Image.Resampling.LANCZOS,
+            )
+        if grayscale:
+            prepared = prepared.convert("L").convert("RGB")
+        adapter = _load_embedding_model(model_path, device, batch_size, provider, dimension)
+        return adapter.encode_images([prepared], instruction=instruction)[0]
+    except (EmbeddingModelUnavailable, EmbeddingAdapterError) as exc:
         raise EmbeddingModelUnavailable(f"[IAT] Failed to encode image with local embedding model: {exc}") from exc
 
 
-def _encode_text_batch(model_path: str, texts: Sequence[str], device: str, batch_size: int) -> List[List[float]]:
-    import torch
-
-    resolved_device = _resolve_embedding_device(device)
-    processor, model = _load_embedding_model(model_path, resolved_device)
-    vectors: List[List[float]] = []
-    for start in range(0, len(texts), batch_size):
-        inputs = processor(text=list(texts[start : start + batch_size]), padding=True, return_tensors="pt")
-        with torch.inference_mode():
-            features = model.get_text_features(**_move_inputs(inputs, resolved_device))
-        vectors.extend(_as_float_lists(features))
-    return vectors
+def _encode_text_batch(
+    model_path: str,
+    texts: Sequence[str],
+    device: str,
+    batch_size: int,
+    provider: str = "auto",
+    dimension: int = 0,
+    instruction: str = "",
+) -> List[List[float]]:
+    try:
+        adapter = _load_embedding_model(model_path, device, batch_size, provider, dimension)
+        return adapter.encode_texts(texts, instruction=instruction)
+    except (EmbeddingModelUnavailable, EmbeddingAdapterError) as exc:
+        raise EmbeddingModelUnavailable(f"[IAT] Failed to encode text batch: {exc}") from exc
 
 
 def _encode_image_batch(
@@ -813,27 +1421,78 @@ def _encode_image_batch(
     device: str,
     batch_size: int,
     grayscale: bool,
+    provider: str = "auto",
+    dimension: int = 0,
+    instruction: str = "",
 ) -> List[List[float]]:
-    import torch
+    try:
+        from PIL import Image
 
-    resolved_device = _resolve_embedding_device(device)
-    processor, model = _load_embedding_model(model_path, resolved_device)
+        prepared = []
+        for image in images:
+            value = image.convert("RGB")
+            if provider == "qwen3_vl" and max(value.size) > _QWEN_IMAGE_MAX_SIDE:
+                scale = _QWEN_IMAGE_MAX_SIDE / max(value.size)
+                value = value.resize(
+                    (max(1, round(value.width * scale)), max(1, round(value.height * scale))),
+                    Image.Resampling.LANCZOS,
+                )
+            if grayscale:
+                value = value.convert("L").convert("RGB")
+            prepared.append(value)
+        adapter = _load_embedding_model(model_path, device, batch_size, provider, dimension)
+        return adapter.encode_images(prepared, instruction=instruction)
+    except (EmbeddingModelUnavailable, EmbeddingAdapterError) as exc:
+        raise EmbeddingModelUnavailable(f"[IAT] Failed to encode image batch: {exc}") from exc
+
+
+def _encode_image_paths(
+    model_path: str,
+    image_paths: Sequence[Path],
+    device: str,
+    batch_size: int,
+    grayscale: bool,
+    provider: str,
+    dimension: int,
+    instruction: str,
+) -> List[List[float]]:
+    from PIL import Image
+
     vectors: List[List[float]] = []
-    for start in range(0, len(images), batch_size):
-        batch = images[start : start + batch_size]
-        prepared = [image.convert("L").convert("RGB") if grayscale else image.convert("RGB") for image in batch]
-        inputs = processor(images=prepared, return_tensors="pt")
-        with torch.inference_mode():
-            features = model.get_image_features(**_move_inputs(inputs, resolved_device))
-        vectors.extend(_as_float_lists(features))
+    for start in range(0, len(image_paths), batch_size):
+        images = []
+        try:
+            for image_path in image_paths[start : start + batch_size]:
+                with Image.open(image_path) as image:
+                    images.append(image.convert("RGB").copy())
+            vectors.extend(
+                _encode_image_batch(
+                    model_path,
+                    images,
+                    device,
+                    batch_size,
+                    grayscale=grayscale,
+                    provider=provider,
+                    dimension=dimension,
+                    instruction=instruction,
+                )
+            )
+        finally:
+            for image in images:
+                image.close()
     return vectors
 
 
 def _serialize_index(index: DatasetIndex) -> Dict[str, Any]:
     return {
-        "schema_version": 3,
+        "schema_version": _INDEX_SCHEMA_VERSION,
         "fingerprint": index.fingerprint,
         "embedding_model_path": index.embedding_model_path,
+        "embedding_provider": index.embedding_provider,
+        "embedding_dimension": index.embedding_dimension,
+        "query_instruction": index.query_instruction,
+        "document_instruction": index.document_instruction,
+        "model_signature": index.model_signature,
         "text_embeddings": index.text_embeddings,
         "image_embeddings": index.image_embeddings,
         "gray_embeddings": index.gray_embeddings,
@@ -843,6 +1502,7 @@ def _serialize_index(index: DatasetIndex) -> Dict[str, Any]:
                 "caption": entry.caption,
                 "image_path": entry.relative_image_path,
                 "image_paths": entry.grouped_relative_image_paths(),
+                "metadata": dict(entry.metadata),
             }
             for entry in index.record.entries
         ],
@@ -855,8 +1515,14 @@ def _deserialize_index(
     fingerprint: str,
     embedding_model_path: str,
     embedding_device: str,
+    embedding_provider: str,
+    embedding_batch_size: int,
+    embedding_dimension: int,
+    query_instruction: str,
+    document_instruction: str,
+    model_signature: str,
 ) -> Optional[DatasetIndex]:
-    if payload.get("schema_version") != 3 or payload.get("fingerprint") != fingerprint:
+    if payload.get("schema_version") != _INDEX_SCHEMA_VERSION or payload.get("fingerprint") != fingerprint:
         return None
     entries = payload.get("entries")
     if not isinstance(entries, list) or len(entries) != len(record.entries):
@@ -866,10 +1532,21 @@ def _deserialize_index(
             expected.record_id != cached.get("record_id")
             or expected.caption != cached.get("caption")
             or expected.grouped_relative_image_paths() != (cached.get("image_paths") or {})
+            or expected.metadata != (cached.get("metadata") or {})
         ):
             return None
     cached_model_path = str(payload.get("embedding_model_path") or "")
     if cached_model_path != str(embedding_model_path or ""):
+        return None
+    if str(payload.get("embedding_provider") or "auto") != embedding_provider:
+        return None
+    if int(payload.get("embedding_dimension") or 0) != int(embedding_dimension or 0):
+        return None
+    if str(payload.get("query_instruction") or "") != query_instruction:
+        return None
+    if str(payload.get("document_instruction") or "") != document_instruction:
+        return None
+    if str(payload.get("model_signature") or "") != model_signature:
         return None
     text_embeddings = payload.get("text_embeddings") or []
     image_embeddings = payload.get("image_embeddings") or []
@@ -902,6 +1579,12 @@ def _deserialize_index(
         gray_embeddings=gray_embeddings,
         embedding_model_path=cached_model_path,
         embedding_device=embedding_device,
+        embedding_provider=embedding_provider,
+        embedding_batch_size=embedding_batch_size,
+        embedding_dimension=embedding_dimension,
+        query_instruction=query_instruction,
+        document_instruction=document_instruction,
+        model_signature=model_signature,
     )
 
 
@@ -912,9 +1595,72 @@ def get_dataset_index(
     require_embeddings: bool = False,
     embedding_device: str = "cpu",
     embedding_batch_size: int = 16,
+    embedding_provider: str = "auto",
+    embedding_dimension: int = 0,
+    embedding_query_instruction: str = "",
+    embedding_document_instruction: str = "",
 ) -> DatasetIndex:
     fingerprint = dataset_fingerprint(record)
     resolved_device = _resolve_embedding_device(embedding_device) if embedding_model_path else "cpu"
+    resolved_provider = (embedding_provider or "auto").strip().lower().replace("-", "_")
+    model_signature = ""
+    if embedding_model_path:
+        try:
+            resolved_provider = detect_embedding_provider(embedding_model_path, resolved_provider)
+            model_signature = embedding_model_signature(embedding_model_path, resolved_provider)
+        except EmbeddingAdapterError as exc:
+            if record.bundle_path is not None:
+                raise EmbeddingModelUnavailable(f"[IAT] {exc}") from exc
+            # Unit tests can mock the loader with a synthetic path; real loads still fail below.
+            model_signature = hashlib.sha256(str(embedding_model_path).encode("utf-8")).hexdigest()
+
+    if record.bundle_path is not None:
+        if not embedding_model_path:
+            raise EmbeddingModelUnavailable(
+                "[IAT] Compiled datasets require the same local embedding model used during compilation."
+            )
+        metadata = record.metadata
+        expected_provider = str(metadata.get("embedding_provider") or "")
+        expected_signature = str(metadata.get("embedding_model_signature") or "")
+        expected_dimension = int(metadata.get("embedding_dimension") or 0)
+        stored_query_instruction = str(metadata.get("embedding_query_instruction") or "")
+        stored_document_instruction = str(metadata.get("embedding_document_instruction") or "")
+        if resolved_provider != expected_provider:
+            raise EmbeddingModelUnavailable(
+                f"[IAT] Compiled dataset requires embedding provider `{expected_provider}`, got `{resolved_provider}`."
+            )
+        if model_signature != expected_signature:
+            raise EmbeddingModelUnavailable(
+                "[IAT] Configured embedding model does not match the model used to compile this dataset."
+            )
+        if embedding_dimension and int(embedding_dimension) != expected_dimension:
+            raise EmbeddingModelUnavailable(
+                f"[IAT] Compiled dataset uses {expected_dimension}-dimensional embeddings, "
+                f"but config requests {embedding_dimension}."
+            )
+        if embedding_query_instruction and embedding_query_instruction != stored_query_instruction:
+            raise EmbeddingModelUnavailable(
+                "[IAT] Query instruction differs from the instruction stored in the compiled dataset."
+            )
+        if embedding_document_instruction and embedding_document_instruction != stored_document_instruction:
+            raise EmbeddingModelUnavailable(
+                "[IAT] Document instruction differs from the instruction stored in the compiled dataset."
+            )
+        return DatasetIndex(
+            record,
+            fingerprint,
+            text_embeddings=record.bundled_text_embeddings,
+            image_embeddings=record.bundled_image_embeddings,
+            gray_embeddings=record.bundled_gray_embeddings,
+            embedding_model_path=str(embedding_model_path),
+            embedding_device=resolved_device,
+            embedding_provider=resolved_provider,
+            embedding_batch_size=embedding_batch_size,
+            embedding_dimension=expected_dimension,
+            query_instruction=stored_query_instruction,
+            document_instruction=stored_document_instruction,
+            model_signature=model_signature,
+        )
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / f"{_safe_name(record.dataset_name)}.index.json"
@@ -926,6 +1672,12 @@ def get_dataset_index(
                 fingerprint,
                 embedding_model_path,
                 resolved_device,
+                resolved_provider,
+                embedding_batch_size,
+                embedding_dimension,
+                embedding_query_instruction,
+                embedding_document_instruction,
+                model_signature,
             )
             if cached is not None:
                 if require_embeddings and not cached.text_embeddings:
@@ -942,16 +1694,23 @@ def get_dataset_index(
     gray_embeddings: List[Optional[List[float]]] = []
     if embedding_model_path:
         batch_size = max(1, int(embedding_batch_size))
-        _load_embedding_model(embedding_model_path, resolved_device)
+        _load_embedding_model(
+            embedding_model_path,
+            resolved_device,
+            batch_size,
+            resolved_provider,
+            embedding_dimension,
+        )
         text_embeddings = _encode_text_batch(
             embedding_model_path,
             [entry.caption for entry in record.entries],
             resolved_device,
             batch_size,
+            provider=resolved_provider,
+            dimension=embedding_dimension,
+            instruction=embedding_document_instruction,
         )
-        from PIL import Image
-
-        images: List[Any] = []
+        image_paths: List[Path] = []
         image_counts: List[int] = []
         image_embeddings = [None] * len(record.entries)
         gray_embeddings = [None] * len(record.entries)
@@ -962,12 +1721,29 @@ def get_dataset_index(
                 continue
             count = 0
             for image_path in entry_images.values():
-                with Image.open(image_path) as image:
-                    images.append(image.convert("RGB").copy())
+                image_paths.append(image_path)
                 count += 1
             image_counts.append(count)
-        rgb_vectors = _encode_image_batch(embedding_model_path, images, resolved_device, batch_size, grayscale=False)
-        gray_vectors = _encode_image_batch(embedding_model_path, images, resolved_device, batch_size, grayscale=True)
+        rgb_vectors = _encode_image_paths(
+            embedding_model_path,
+            image_paths,
+            resolved_device,
+            batch_size,
+            grayscale=False,
+            provider=resolved_provider,
+            dimension=embedding_dimension,
+            instruction=embedding_document_instruction,
+        )
+        gray_vectors = _encode_image_paths(
+            embedding_model_path,
+            image_paths,
+            resolved_device,
+            batch_size,
+            grayscale=True,
+            provider=resolved_provider,
+            dimension=embedding_dimension,
+            instruction=embedding_document_instruction,
+        )
         offset = 0
         for idx, count in enumerate(image_counts):
             if not count:
@@ -986,6 +1762,12 @@ def get_dataset_index(
         gray_embeddings=gray_embeddings,
         embedding_model_path=str(embedding_model_path or ""),
         embedding_device=resolved_device,
+        embedding_provider=resolved_provider,
+        embedding_batch_size=embedding_batch_size,
+        embedding_dimension=embedding_dimension,
+        query_instruction=embedding_query_instruction,
+        document_instruction=embedding_document_instruction,
+        model_signature=model_signature,
         warnings=warnings,
     )
     if require_embeddings and not text_embeddings:

@@ -86,10 +86,15 @@ runtime:
   offline_only: true
 
 datasets:
-  root: "../IAT-datasets"
-  embedding_model_path: "models/embeddings/chinese-clip-vit-base-patch16"
-  embedding_device: "cpu"  # cpu / cuda / auto
-  embedding_batch_size: 16
+  root: "IAT-datasets"
+  embedding_model_path: "../../models/embeddings/Qwen3-VL-Embedding-2B"
+  embedding_provider: "qwen3_vl"
+  embedding_device: "cuda"  # cpu / cuda / auto
+  embedding_batch_size: 1
+  embedding_dimension: 2048
+  embedding_query_instruction: "Retrieve automotive CMF training samples that best match the user's text or reference image."
+  embedding_document_instruction: "Represent an automotive CMF training sample for retrieval."
+  embedding_keep_loaded: false
   index_cache_dir: ""
 
 llm:

@@ -220,14 +220,35 @@ reference image is optional and can be used for structure-aware retrieval.
 | image_2 | IMAGE | optional | Reference image 2 |
 | image_3 | IMAGE | optional | Reference image 3 |
 | image_4 | IMAGE | optional | Reference image 4 |
+| auxiliary_color_strategy | Enum | none | Fallback auxiliary-color policy when `cmf_request_json` does not set one |
+| cmf_request_json | STRING | optional | Structured CMF request; when supplied it overrides the free-text color/material fields |
+
+`CMF Color Reference Image（IAT）` accepts the same `cmf_request_json` and
+outputs an exact RGB swatch image plus resolved-color JSON. Connect the image
+to the downstream color-reference path while keeping the generated prompt's
+HEX/RGB text. It does not run Depth/Lineart itself; `retrieval_debug` exposes
+the recommended controls, strengths, and low-denoise handoff for the image
+generation workflow.
+
+`CMF Region Color Acceptance（IAT）` takes one generated `IMAGE`, one region
+`MASK`, and a target HEX. It reports masked mean RGB and CIEDE2000, so each
+region can be accepted or rejected independently after generation.
 
 ### Notes
 
 - `Dataset Caption Picker` does not load a model and uses `random.Random(seed)` for reproducible sampling.
-- `Dataset RAG Prompt Generator` combines Chinese BM25/character n-gram retrieval with an optional local Chinese CLIP index.
+- `Dataset RAG Prompt Generator` combines Chinese BM25/character n-gram retrieval with a local multimodal embedding index. Qwen3-VL-Embedding and Chinese CLIP are supported.
 - Exploration is deterministic: the same backend, model, dataset fingerprint/version, prompt, and seeds produce the same retrieval/composition inputs. Change `retrieval_seed` to explore nearby training examples, `variation_seed` to explore CMF combinations, or `generation_seed` to vary only backend sampling.
-- `temperature=0` means automatic exploration temperature: `Mild=0.15`, `Medium=0.35`, `Strong=0.55`. Set a positive temperature to override the mapped value.
-- User-specified color families are hard constraints. Color names and HEX values may be varied, and the plan may create new component/color/material combinations. The final prompt is repaired to include any requested color family omitted by the backend.
+- The default CMF request is deterministic: `temperature` sent to the backend is `0`. Set `deterministic` to `false` in `cmf_request_json` before using a non-zero temperature or exploration mapping.
+- User-supplied RGB/HEX values are normalized and locked exactly; the rendered conditioning text includes the exact HEX/RGB and a factual OKLCH-derived descriptor. Decorative color names remain metadata and do not control generation.
+- Colors receive stable IDs such as `C1` and `C2`; model assignments use the ID so two colors from the same family cannot overwrite each other.
+- Every requested material must be assigned to at least one compatible component. If the selected material count exceeds the current component capacity, the request fails instead of silently dropping a material.
+- Retrieval is material-aware: when a requested material exists in the dataset, the selected pool reserves one matching sample for it and also retains a `full_cabin` sample when `top_k` has room. `retrieval_debug.material_coverage` shows requested, reserved, used, and missing materials.
+- The fixed component map includes `座椅主面料`, `座椅侧翼`, `门板内衬肌理`, `中控台面上层`, `中控台前饰板`, `马鞍区面板`, and `方向盘`.
+- With a reference image, `retrieval_debug.image_conditioning` recommends Depth/Lineart structure controls, low denoise, and masked Lab/Delta-E 2000 color measurement after generation. Actual ControlNet and region masks remain downstream workflow responsibilities.
+- Auxiliary colors are resolved locally before model planning. The resolved palette and automatically added colors are exposed as `resolved_colors` and `auxiliary_colors` in `retrieval_debug`.
+- The final result is compiled locally through the fixed CMF template `由原状态转变为...，以...为主色调，其中，...。`; model prose, extra colors, and unselected materials are never rendered.
+- Source samples are classified as `full_cabin`, `color_material`, or `detail`. The derived type is stored in the JSON index cache and SQLite chunk metadata.
 - Multi-view datasets group the same filename stem across `control1`, `control2`, `control3`, and `result`; one `result/<stem>.txt` caption represents the group.
 - The generator accepts up to four reference images. A batched IMAGE input is expanded into individual images and sent together to the selected backend.
 - The index cache is automatically rebuilt when `dataset.json`, image files, or captions change.
@@ -235,6 +256,56 @@ reference image is optional and can be used for structure-aware retrieval.
 - Local generation reuses the existing Transformers cache. Ollama uses native `/api/chat`; vLLM uses `/v1/chat/completions`.
 - The default configuration is fully offline and points at local Ollama `qwen3.5:122b`.
 - The node returns the final prompt, retrieved captions, retrieval scores/debug JSON, and dataset metadata.
+
+### Portable SQLite datasets
+
+Drag one dataset directory, or the dataset root for a batch build, onto
+`build_iatdb.cmd`. The builder uses the local embedding settings in `config.yaml`
+and writes bundles under `compiled/`. Repeating the build skips unchanged data.
+Each `.iatdb` contains metadata, captions, and normalized text/RGB/grayscale
+vectors only. It does not contain original images. Qwen3-VL inputs are resized
+to a maximum side of 768 pixels before embedding so build and query preprocessing
+remain identical on 24 GB GPUs.
+
+### Structured CMF request
+
+Use `cmf_request_json` for the production contract. `user_prompt` may remain
+empty when this field is connected:
+
+```json
+{
+  "style_id": "offroad",
+  "scope": "full_cabin",
+  "colors": [
+    {"family": "orange", "hex": "#c96f3a", "role": "primary"},
+    {"family": "gray", "hex": "#2f3f49", "role": "secondary"}
+  ],
+  "materials": ["suede", "fabric"],
+  "preserve_geometry": true,
+  "palette_policy": "balanced",
+  "auxiliary_color_strategy": "style",
+  "material_policy": "strict",
+  "trigger_mode": "inline",
+  "deterministic": true
+}
+```
+
+RGB can be used instead of HEX, or both can be supplied and must agree. When
+the field is omitted, the node still parses the existing short label format,
+for example `越野CMF风格，紫色系（#A077AB）、黑色系、麂皮，织物`.
+
+`auxiliary_color_strategy` supports four deterministic policies:
+
+- `reuse_secondary`: add no new color; missing accent/neutral roles reuse the selected secondary color, then the primary color.
+- `dataset`: fill missing roles only from colors found in the retrieved captions. It never falls back to style colors.
+- `style`: fill missing roles from the style palette. The off-road defaults are orange/gray/brown/black and the home defaults are beige/gray/brown/black.
+- `none`: add no color and synthesize no missing auxiliary role; component assignments use only explicitly selected colors. This is the production default. At least one user color is required.
+
+An explicit value inside `cmf_request_json` overrides the node dropdown. For
+legacy requests, `palette_policy: "input_only"` and `palette_policy: "strict"`
+map to `none` when `auxiliary_color_strategy` is omitted. Automatically added
+accent and neutral colors are rendered only in component clauses, not in the
+`以...为主色调` header.
 
 ### Example Workflow
 

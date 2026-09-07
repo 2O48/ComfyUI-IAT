@@ -20,3 +20,4 @@ packaging>=24.0
 # 模型自动下载（ModelScope 优先，HuggingFace 兜底）
 modelscope>=1.18.0
 huggingface_hub>=0.24.0
+sentence-transformers>=5.4.0

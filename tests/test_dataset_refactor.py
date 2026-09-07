@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -11,13 +14,34 @@ from unittest.mock import patch
 from PIL import Image
 
 from py.nodes.dataset_repository import (
+    _encode_image_batch,
     DatasetIndex,
     DatasetError,
     choose_caption,
+    dataset_fingerprint,
     discover_datasets,
     get_dataset_index,
+    load_dataset_bundle,
     load_dataset_record,
+    write_dataset_bundle,
 )
+from py.nodes.embedding_adapters import (
+    Qwen3VLEmbeddingAdapter,
+    detect_embedding_provider,
+    embedding_model_signature,
+)
+from py.nodes.cmf_prompt import (
+    CMFRequestError,
+    build_cmf_image_conditioning_contract,
+    build_cmf_plan,
+    classify_caption,
+    delta_e_2000,
+    normalize_cmf_request,
+    parse_cmf_structure_output,
+    render_cmf_prompt,
+    validate_cmf_prompt,
+)
+from py.nodes.cmf_prompt import family_from_hex
 from py.nodes.llm_backends import _generate_ollama, _generate_vllm
 
 
@@ -184,7 +208,7 @@ class DatasetRepositoryTests(unittest.TestCase):
             results, debug = index.retrieve("红色 金属", top_k=1, seed=42)
             self.assertEqual(len(results), 1)
             self.assertEqual(results[0]["record_id"], "images/0001")
-            self.assertTrue(debug["index_version"].startswith("hybrid-v3:"))
+            self.assertTrue(debug["index_version"].startswith("hybrid-v5:"))
             cached = get_dataset_index(record, cache)
             self.assertEqual(cached.fingerprint, index.fingerprint)
 
@@ -193,6 +217,38 @@ class DatasetRepositoryTests(unittest.TestCase):
             changed_record = load_dataset_record(record.source_path.parent)
             rebuilt = get_dataset_index(changed_record, cache)
             self.assertNotEqual(rebuilt.fingerprint, index.fingerprint)
+
+    def test_material_aware_retrieval_reserves_each_requested_material(self):
+        from py.nodes.dataset_repository import DatasetEntry, DatasetRecord
+
+        record = DatasetRecord(
+            dataset_name="cmf",
+            version="1.0",
+            base_model="Flux.2 Klein 9B",
+            lora_name="cmf",
+            language="zh",
+            trigger_words=["cmf"],
+            entries=[
+                DatasetEntry("full", "完整座舱全景，皮质座椅和门板"),
+                DatasetEntry("leather", "座椅主面料使用黑色皮质"),
+                DatasetEntry("fabric", "门板内衬使用灰色织物"),
+                DatasetEntry("suede", "中控台使用棕色麂皮"),
+                DatasetEntry("extra", "黑色皮质座舱细节"),
+            ],
+            source_path=Path("dataset.json"),
+        )
+        results, debug = DatasetIndex(record, "fingerprint").retrieve(
+            "越野座舱",
+            top_k=4,
+            required_materials=["leather", "fabric", "suede"],
+        )
+        result_ids = {item["record_id"] for item in results}
+        used_materials = {
+            material for item in results for material in item["material_tags"]
+        }
+        self.assertTrue({"leather", "fabric", "suede"}.issubset(used_materials))
+        self.assertIn("full", result_ids)
+        self.assertEqual(debug["material_coverage"]["missing"], [])
 
     def test_exploration_retrieval_is_reproducible_and_seeded(self):
         from py.nodes.dataset_repository import DatasetEntry, DatasetRecord
@@ -340,14 +396,14 @@ class DatasetRepositoryTests(unittest.TestCase):
     @patch("py.nodes.dataset_repository._encode_text_batch", return_value=[[1.0, 0.0], [0.0, 1.0]])
     @patch("py.nodes.dataset_repository._encode_image_batch", return_value=[[1.0, 0.0]] * 8)
     @patch("py.nodes.dataset_repository._resolve_embedding_device", return_value="cpu")
-    def test_multiview_cache_uses_schema_v3(self, resolve_device, encode_image_batch, encode_text_batch, load_model):
+    def test_multiview_cache_uses_schema_v5(self, resolve_device, encode_image_batch, encode_text_batch, load_model):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             record = load_dataset_record(self.make_multiview_dataset(root))
             cache_dir = root / "cache"
             get_dataset_index(record, cache_dir, embedding_model_path="model")
             payload = json.loads((cache_dir / "dataset_A.index.json").read_text(encoding="utf-8"))
-        self.assertEqual(payload["schema_version"], 3)
+        self.assertEqual(payload["schema_version"], 5)
         self.assertEqual(len(payload["entries"][0]["image_paths"]), 4)
 
     @patch("py.nodes.dataset_repository._load_embedding_model")
@@ -401,6 +457,173 @@ class DatasetRepositoryTests(unittest.TestCase):
             records, errors = discover_datasets(root)
             self.assertNotIn("dataset_A", records)
             self.assertTrue(any("Duplicate dataset_name" in error for error in errors))
+
+    def test_compiled_bundle_round_trip_and_precedence_over_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            record = load_dataset_record(self.make_multiview_dataset(root))
+            index = DatasetIndex(
+                record,
+                dataset_fingerprint(record),
+                text_embeddings=[[1.0, 0.0], [0.0, 1.0]],
+                image_embeddings=[[0.8, 0.2], [0.2, 0.8]],
+                gray_embeddings=[[0.7, 0.3], [0.3, 0.7]],
+                embedding_model_path="model",
+                embedding_provider="qwen3_vl",
+                embedding_dimension=2,
+                query_instruction="query",
+                document_instruction="document",
+                model_signature="signature",
+            )
+            bundle_path = root / "compiled" / "dataset_A.iatdb"
+            write_dataset_bundle(index, bundle_path)
+            loaded = load_dataset_bundle(bundle_path)
+            records, errors = discover_datasets(root)
+
+        self.assertFalse(errors)
+        self.assertEqual(loaded.dataset_name, "dataset_A")
+        self.assertEqual(len(loaded.entries), 2)
+        self.assertEqual(loaded.entries[0].grouped_image_paths(), {})
+        self.assertEqual(loaded.metadata["embedding_provider"], "qwen3_vl")
+        self.assertEqual(loaded.entries[0].sample_types, ["detail"])
+        self.assertIn("sample_type_counts", loaded.metadata)
+        self.assertEqual(records["dataset_A"].bundle_path, bundle_path)
+
+    def test_compiled_bundle_rejects_truncated_vector(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            record = load_dataset_record(self.make_dataset(root))
+            index = DatasetIndex(
+                record,
+                dataset_fingerprint(record),
+                text_embeddings=[[1.0, 0.0], [0.0, 1.0]],
+                image_embeddings=[[1.0, 0.0], [0.0, 1.0]],
+                gray_embeddings=[[1.0, 0.0], [0.0, 1.0]],
+                embedding_model_path="model",
+                embedding_provider="qwen3_vl",
+                embedding_dimension=2,
+                model_signature="signature",
+            )
+            bundle_path = root / "dataset_A.iatdb"
+            write_dataset_bundle(index, bundle_path)
+            connection = sqlite3.connect(str(bundle_path))
+            try:
+                connection.execute("UPDATE chunks SET text_embedding = ? WHERE ordinal = 0", (b"bad",))
+                connection.commit()
+            finally:
+                connection.close()
+            with self.assertRaisesRegex(DatasetError, "invalid text vector"):
+                load_dataset_bundle(bundle_path)
+
+    def test_compiled_bundle_requires_matching_local_model(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            model = root / "model"
+            model.mkdir()
+            (model / "config.json").write_text('{"model_type":"qwen3_vl"}', encoding="utf-8")
+            (model / "config_sentence_transformers.json").write_text("{}", encoding="utf-8")
+            (model / "model.safetensors").write_bytes(b"weights")
+            record = load_dataset_record(self.make_dataset(root))
+            signature = embedding_model_signature(str(model), "qwen3_vl")
+            index = DatasetIndex(
+                record,
+                dataset_fingerprint(record),
+                text_embeddings=[[1.0, 0.0], [0.0, 1.0]],
+                image_embeddings=[[1.0, 0.0], [0.0, 1.0]],
+                gray_embeddings=[[1.0, 0.0], [0.0, 1.0]],
+                embedding_model_path=str(model),
+                embedding_provider="qwen3_vl",
+                embedding_dimension=2,
+                model_signature=signature,
+            )
+            bundle_path = root / "dataset_A.iatdb"
+            write_dataset_bundle(index, bundle_path)
+            compiled = load_dataset_bundle(bundle_path)
+            loaded_index = get_dataset_index(
+                compiled,
+                root / "cache",
+                embedding_model_path=str(model),
+                embedding_provider="qwen3_vl",
+                embedding_dimension=2,
+            )
+            self.assertEqual(loaded_index.text_embeddings, index.text_embeddings)
+            (model / "config.json").write_text('{"model_type":"qwen3_vl","changed":true}', encoding="utf-8")
+            with self.assertRaisesRegex(DatasetError, "does not match"):
+                get_dataset_index(
+                    compiled,
+                    root / "cache",
+                    embedding_model_path=str(model),
+                    embedding_provider="qwen3_vl",
+                    embedding_dimension=2,
+                )
+
+
+class EmbeddingAdapterTests(unittest.TestCase):
+    @patch("py.nodes.dataset_repository._load_embedding_model")
+    def test_qwen_image_preprocessing_caps_max_side(self, load_model):
+        encoded_sizes = []
+
+        class FakeAdapter:
+            def encode_images(self, images, instruction=""):
+                encoded_sizes.extend((image.size, image.mode, instruction) for image in images)
+                return [[1.0, 0.0] for _ in images]
+
+        load_model.return_value = FakeAdapter()
+        vectors = _encode_image_batch(
+            "model",
+            [Image.new("RGB", (1600, 800))],
+            "cpu",
+            1,
+            grayscale=True,
+            provider="qwen3_vl",
+            instruction="Retrieve CMF samples.",
+        )
+
+        self.assertEqual(vectors, [[1.0, 0.0]])
+        self.assertEqual(encoded_sizes, [((768, 384), "RGB", "Retrieve CMF samples.")])
+
+    def test_qwen_provider_detection_and_signature_survive_copy(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            first = root / "first"
+            second = root / "second"
+            first.mkdir()
+            (first / "config.json").write_text('{"model_type":"qwen3_vl"}', encoding="utf-8")
+            (first / "config_sentence_transformers.json").write_text("{}", encoding="utf-8")
+            (first / "model.safetensors").write_bytes(b"weights")
+            shutil.copytree(first, second)
+            self.assertEqual(detect_embedding_provider(str(first)), "qwen3_vl")
+            self.assertEqual(embedding_model_signature(str(first)), embedding_model_signature(str(second)))
+
+    def test_qwen_adapter_passes_instruction_and_normalizes(self):
+        calls = []
+
+        class FakeSentenceTransformer:
+            def __init__(self, *args, **kwargs):
+                calls.append(("init", args, kwargs))
+
+            def encode(self, inputs, **kwargs):
+                import numpy as np
+
+                calls.append(("encode", inputs, kwargs))
+                return np.asarray([[3.0, 4.0, 0.0] for _ in inputs], dtype=np.float32)
+
+            def to(self, device):
+                calls.append(("to", device))
+
+        module = types.ModuleType("sentence_transformers")
+        module.SentenceTransformer = FakeSentenceTransformer
+        with tempfile.TemporaryDirectory() as temp, patch.dict(sys.modules, {"sentence_transformers": module}):
+            adapter = Qwen3VLEmbeddingAdapter(temp, "cpu", batch_size=2, dimension=2)
+            vectors = adapter.encode_texts(["a", "b"], instruction="Retrieve CMF samples.")
+            image_vectors = adapter.encode_images([Image.new("RGB", (2, 2))], instruction="Retrieve CMF samples.")
+
+        self.assertEqual(len(vectors), 2)
+        self.assertAlmostEqual(sum(value * value for value in vectors[0]), 1.0, places=6)
+        self.assertEqual(len(image_vectors[0]), 2)
+        encode_calls = [call for call in calls if call[0] == "encode"]
+        self.assertEqual(encode_calls[0][2]["prompt"], "Retrieve CMF samples.")
+        self.assertIn("image", encode_calls[1][1][0])
 
 
 class BackendRequestTests(unittest.TestCase):
@@ -493,19 +716,315 @@ class BackendRequestTests(unittest.TestCase):
         self.assertEqual(sum(item["type"] == "image_url" for item in content), 4)
 
 
+class CMFPromptTests(unittest.TestCase):
+    def test_color_normalization_pairs_hex_with_the_adjacent_family(self):
+        request = normalize_cmf_request(
+            "越野CMF风格，紫色系（#A077AB）、黑色系、麂皮，织物",
+            dataset_metadata={"style_id": "offroad"},
+        )
+        self.assertEqual([item["family"] for item in request["colors"]], ["purple", "black"])
+        self.assertEqual([item["hex"] for item in request["colors"]], ["#a077ab", "#111820"])
+        self.assertTrue(request["colors"][0]["locked"])
+        self.assertFalse(request["colors"][1]["locked"])
+        self.assertEqual(request["materials"], ["suede", "fabric"])
+
+    def test_arbitrary_hex_uses_factual_conditioning_label_and_stable_color_id(self):
+        request = normalize_cmf_request(
+            {
+                "style_id": "offroad",
+                "colors": [
+                    {"family": "black", "hex": "#424242"},
+                    {"family": "orange", "hex": "#f9cb8b"},
+                ],
+                "materials": ["leather"],
+            }
+        )
+        self.assertEqual([item["color_id"] for item in request["colors"]], ["C1", "C2"])
+        self.assertEqual(
+            [item["conditioning_label"] for item in request["colors"]],
+            ["中性灰黑", "浅暖杏橙"],
+        )
+        self.assertNotEqual(request["colors"][1]["conditioning_label"], request["colors"][1]["name"])
+
+    def test_material_coverage_repairs_model_that_dropped_requested_materials(self):
+        request = normalize_cmf_request(
+            {
+                "style_id": "offroad",
+                "colors": [{"family": "black", "hex": "#424242"}],
+                "materials": ["leather", "fabric", "suede"],
+                "auxiliary_color_strategy": "none",
+            }
+        )
+        plan = build_cmf_plan(
+            request,
+            model_assignments=[
+                {"component": component, "color_id": "C1", "material": "leather"}
+                for component in ("座椅主面料", "门板内衬肌理", "中控台面上层", "马鞍区面板", "方向盘")
+            ],
+        )
+        self.assertEqual(set(plan["material_coverage"]["used"]), {"leather", "fabric", "suede"})
+        self.assertEqual(plan["material_coverage"]["missing"], [])
+        prompt = render_cmf_prompt(plan)
+        self.assertIn("织物", prompt)
+        self.assertIn("麂皮", prompt)
+        self.assertTrue(validate_cmf_prompt(prompt, plan)["valid"])
+
+    def test_material_count_above_component_capacity_is_rejected(self):
+        request = normalize_cmf_request(
+            {
+                "style_id": "offroad",
+                "colors": [{"family": "black", "hex": "#424242"}],
+                "materials": ["leather", "fabric", "suede", "wood", "metal", "rubber", "plastic", "glass"],
+            }
+        )
+        with self.assertRaisesRegex(CMFRequestError, "只有 7 个可分配区域"):
+            build_cmf_plan(request)
+
+    def test_rgb_hex_conflict_is_rejected(self):
+        with self.assertRaisesRegex(CMFRequestError, "RGB 与 HEX 不一致"):
+            normalize_cmf_request(
+                {
+                    "style_id": "offroad",
+                    "colors": [{"family": "orange", "hex": "#c96f3a", "rgb": [0, 0, 0]}],
+                }
+            )
+
+    def test_oklch_family_inference_handles_dark_brown_and_warm_beige(self):
+        self.assertEqual(family_from_hex("#7a4b2f"), "brown")
+        self.assertEqual(family_from_hex("#d8cbb8"), "beige")
+
+    def test_auxiliary_strategy_validation_and_legacy_palette_policy(self):
+        request = normalize_cmf_request(
+            {
+                "style_id": "offroad",
+                "colors": [{"family": "orange", "hex": "#c96f3a"}],
+                "palette_policy": "strict",
+            },
+            default_auxiliary_color_strategy="style",
+        )
+        self.assertEqual(request["auxiliary_color_strategy"], "none")
+
+        explicit = normalize_cmf_request(
+            {
+                "style_id": "offroad",
+                "colors": [{"family": "orange", "hex": "#c96f3a"}],
+                "palette_policy": "strict",
+                "auxiliary_color_strategy": "style",
+            }
+        )
+        self.assertEqual(explicit["auxiliary_color_strategy"], "style")
+        with self.assertRaisesRegex(CMFRequestError, "auxiliary_color_strategy 必须是"):
+            normalize_cmf_request(
+                {
+                    "style_id": "offroad",
+                    "colors": [{"family": "orange"}],
+                    "auxiliary_color_strategy": "random",
+                }
+            )
+
+    def test_reuse_secondary_and_none_never_add_unrequested_colors(self):
+        base = {
+            "style_id": "offroad",
+            "colors": [
+                {"family": "orange", "hex": "#c96f3a", "role": "primary"},
+                {"family": "gray", "hex": "#2f3f49", "role": "secondary"},
+            ],
+            "materials": ["leather"],
+        }
+        reuse_request = normalize_cmf_request({**base, "auxiliary_color_strategy": "reuse_secondary"})
+        reuse_plan = build_cmf_plan(reuse_request)
+        self.assertEqual([item["family"] for item in reuse_plan["colors"]], ["orange", "gray"])
+        self.assertEqual(reuse_plan["auxiliary_colors"], [])
+        self.assertEqual(
+            [item["color"]["family"] for item in reuse_plan["component_assignments"]],
+            ["orange", "gray", "gray", "gray", "gray", "gray", "gray"],
+        )
+
+        none_request = normalize_cmf_request({**base, "auxiliary_color_strategy": "none"})
+        none_plan = build_cmf_plan(none_request)
+        self.assertEqual([item["family"] for item in none_plan["colors"]], ["orange", "gray"])
+        self.assertEqual(
+            [item["color"]["family"] for item in none_plan["component_assignments"]],
+            ["orange", "gray", "gray", "gray", "orange", "orange", "orange"],
+        )
+        with self.assertRaisesRegex(CMFRequestError, "至少需要一个用户颜色"):
+            normalize_cmf_request(
+                {"style_id": "offroad", "colors": [], "auxiliary_color_strategy": "none"}
+            )
+
+    def test_style_strategy_fills_roles_without_promoting_auxiliary_colors_to_main(self):
+        request = normalize_cmf_request(
+            {
+                "style_id": "offroad",
+                "colors": [
+                    {"family": "orange", "hex": "#c96f3a", "role": "primary"},
+                    {"family": "gray", "hex": "#2f3f49", "role": "secondary"},
+                ],
+                "materials": ["leather", "suede", "wood"],
+                "auxiliary_color_strategy": "style",
+            }
+        )
+        plan = build_cmf_plan(request)
+        self.assertEqual(
+            [(item["role"], item["family"]) for item in plan["colors"]],
+            [("primary", "orange"), ("secondary", "gray"), ("accent", "brown"), ("neutral", "black")],
+        )
+        self.assertEqual([item["family"] for item in plan["auxiliary_colors"]], ["brown", "black"])
+        prompt = render_cmf_prompt(plan)
+        main_palette = prompt.split("为主色调", 1)[0]
+        self.assertIn("橙色系（橙色，#c96f3a，RGB(201,111,58)）", main_palette)
+        self.assertIn("灰色系（深灰，#2f3f49，RGB(47,63,73)）", main_palette)
+        self.assertNotIn("棕色系", main_palette)
+        self.assertNotIn("黑色系", main_palette)
+        self.assertIn("马鞍区面板使用棕色系（低饱和棕色，#7a4b2f，RGB(122,75,47)）", prompt)
+        self.assertIn("方向盘使用黑色系（深中性灰黑，#111820，RGB(17,24,32)）", prompt)
+        self.assertTrue(validate_cmf_prompt(prompt, plan)["valid"])
+
+    def test_dataset_strategy_uses_only_retrieved_auxiliary_colors(self):
+        request = normalize_cmf_request(
+            {
+                "style_id": "offroad",
+                "colors": [{"family": "orange", "hex": "#c96f3a", "role": "primary"}],
+                "materials": ["leather"],
+                "auxiliary_color_strategy": "dataset",
+            }
+        )
+        retrieved = [
+            {
+                "caption": (
+                    "灰色系（岩岭蓝灰，#2f3f49），棕色系（胡桃木棕，#7a4b2f），"
+                    "黑色系（深曜黑，#111820）"
+                )
+            }
+        ]
+        plan = build_cmf_plan(request, retrieved=retrieved)
+        self.assertEqual(
+            [(item["role"], item["family"], item["source"]) for item in plan["colors"]],
+            [
+                ("primary", "orange", "user"),
+                ("secondary", "gray", "dataset"),
+                ("accent", "brown", "dataset"),
+                ("neutral", "black", "dataset"),
+            ],
+        )
+        empty_request = normalize_cmf_request(
+            {"style_id": "offroad", "colors": [], "auxiliary_color_strategy": "dataset"}
+        )
+        with self.assertRaisesRegex(CMFRequestError, "检索结果没有可用颜色"):
+            build_cmf_plan(empty_request, retrieved=[])
+
+    def test_fixed_renderer_uses_pinned_names_and_validates_every_constraint(self):
+        request = normalize_cmf_request(
+            "由原状态转变为越野风格CMF设计，以橙色系（荒漠赤陶橙，#c96f3a）与灰色系（岩岭蓝灰，#2f3f49）为主色调",
+            dataset_metadata={"style_id": "offroad"},
+        )
+        plan = build_cmf_plan(
+            request,
+            {"trigger_words": ["越野风格CMF设计"]},
+            [],
+        )
+        prompt = render_cmf_prompt(plan)
+        self.assertTrue(prompt.startswith("由原状态转变为越野风格CMF设计，以橙色系（橙色，#c96f3a，RGB(201,111,58)）"))
+        self.assertIn("灰色系（深灰，#2f3f49，RGB(47,63,73)）", prompt)
+        self.assertTrue(validate_cmf_prompt(prompt, plan)["valid"])
+        self.assertNotIn("#c96f3b", prompt)
+
+    def test_model_assignments_cannot_inject_unrequested_color_or_material(self):
+        request = normalize_cmf_request(
+            {
+                "style_id": "offroad",
+                "colors": [
+                    {"family": "orange", "hex": "#c96f3a"},
+                    {"family": "gray", "hex": "#2f3f49"},
+                ],
+                "materials": ["suede", "fabric"],
+            }
+        )
+        plan = build_cmf_plan(
+            request,
+            {"trigger_words": ["越野风格CMF设计"]},
+            [],
+            model_assignments=[
+                {"component": "座椅主面料", "color_family": "brown", "material": "wood"},
+                {"component": "门板", "color_family": "gray", "material": "suede"},
+            ],
+        )
+        prompt = render_cmf_prompt(plan)
+        self.assertNotIn("棕色系", prompt)
+        self.assertNotIn("木纹", prompt)
+        self.assertIn("门板内衬肌理使用灰色系", prompt)
+        self.assertTrue(validate_cmf_prompt(prompt, plan)["valid"])
+
+    def test_caption_classification_separates_full_cabin_color_material_and_detail(self):
+        self.assertEqual(classify_caption("完整座舱全景，座椅和门板采用皮质"), ["full_cabin"])
+        self.assertEqual(classify_caption("由原状态转变为以黑色系（炭黑，#000000）为主色调"), ["color_material"])
+        self.assertEqual(classify_caption("座椅主面料使用橙色皮质，门板内衬使用灰色麂皮"), ["detail"])
+
+    def test_model_structure_parser_ignores_wrappers_and_non_assignments(self):
+        output = "<think>ignore</think>```json\n{\"assignments\":[{\"component\":\"方向盘\",\"color_family\":\"black\",\"material\":\"皮质\"}],\"note\":\"ignore\"}\n```"
+        self.assertEqual(
+            parse_cmf_structure_output(output),
+            [{"component": "方向盘", "color_family": "black", "material": "皮质"}],
+        )
+
+    def test_image_conditioning_contract_exposes_color_geometry_and_post_checks(self):
+        request = normalize_cmf_request(
+            {
+                "colors": [{"family": "orange", "hex": "#c96f3a"}],
+                "materials": ["leather"],
+                "preserve_geometry": True,
+                "preserve_reference_color": True,
+            }
+        )
+        contract = build_cmf_image_conditioning_contract(request, reference_image_count=1)
+        self.assertEqual(contract["recommended_controls"], ["depth", "lineart"])
+        self.assertEqual(contract["color_condition"], "exact_hex_rgb_text_and_color_reference")
+        self.assertEqual(contract["post_generation_check"]["color_measurement"], "masked_lab_delta_e_2000")
+
+    def test_region_color_acceptance_uses_masked_ciede2000(self):
+        import torch
+        from py.nodes.qwen35_dataset_rag_nodes import CMFRegionColorAcceptanceNode
+
+        self.assertAlmostEqual(delta_e_2000((201, 111, 58), (201, 111, 58)), 0.0, places=6)
+        image = torch.tensor([[[[201 / 255.0, 111 / 255.0, 58 / 255.0] for _ in range(4)] for _ in range(4)]])
+        mask = torch.ones((1, 4, 4))
+        accepted, raw = CMFRegionColorAcceptanceNode().measure_region(image, mask, "#C96F3A")
+        self.assertTrue(accepted)
+        self.assertEqual(json.loads(raw)["delta_e_2000"], 0.0)
+
+
 class NodeBehaviorTests(unittest.TestCase):
     def test_dataset_nodes_import_without_torch_and_expose_split_contract(self):
         import py.nodes.qwen35_dataset_rag_nodes as module
 
         self.assertEqual(
             set(module.NODE_CLASS_MAPPINGS),
-            {"DatasetCaptionPicker by IAT", "DatasetRAGPromptGenerator by IAT"},
+            {
+                "DatasetCaptionPicker by IAT",
+                "DatasetRAGPromptGenerator by IAT",
+                "CMFColorReferenceImage by IAT",
+                "CMFRegionColorAcceptance by IAT",
+            },
         )
         picker = module.DatasetCaptionPickerNode()
         self.assertEqual(len(picker.RETURN_TYPES), 4)
         generator = module.DatasetRAGPromptGeneratorNode()
         self.assertEqual(generator.RETURN_NAMES, ("prompt", "retrieved_captions", "retrieval_debug", "dataset_metadata"))
-        self.assertEqual(set(generator.INPUT_TYPES()["optional"]), {"image", "image_2", "image_3", "image_4"})
+        self.assertEqual(
+            set(generator.INPUT_TYPES()["optional"]),
+            {
+                "image",
+                "image_2",
+                "image_3",
+                "image_4",
+                "auxiliary_color_strategy",
+                "cmf_request_json",
+            },
+        )
+        self.assertEqual(
+            generator.INPUT_TYPES()["optional"]["auxiliary_color_strategy"][0],
+            ("reuse_secondary", "dataset", "style", "none"),
+        )
         required = generator.INPUT_TYPES()["required"]
         self.assertIn("exploration_strength", required)
         self.assertIn("variation_seed", required)
@@ -639,10 +1158,10 @@ class NodeBehaviorTests(unittest.TestCase):
         debug = json.loads(first[2])
         self.assertEqual(debug["variation_seed"], 9)
         self.assertEqual(debug["exploration_strength"], "Medium")
-        self.assertEqual(debug["effective_temperature"], 0.35)
+        self.assertEqual(debug["effective_temperature"], 0.0)
         self.assertIn("variation_plan", debug)
         self.assertEqual(generate.call_count, 2)
-        self.assertEqual(generate.call_args.kwargs["temperature"], 0.35)
+        self.assertEqual(generate.call_args.kwargs["temperature"], 0.0)
         self.assertEqual(generate.call_args.kwargs["seed"], debug["generation_seed"])
         self.assertIn("只输出一条最终可用于生图的提示词正文", generate.call_args.kwargs["system_prompt"])
 
@@ -698,6 +1217,80 @@ class NodeBehaviorTests(unittest.TestCase):
             )
         self.assertIn("黑色系", output[0])
         self.assertNotIn("brown", output[0].casefold())
+
+    def test_generator_accepts_structured_cmf_request_and_renders_fixed_template(self):
+        import py.nodes.qwen35_dataset_rag_nodes as module
+        from py.nodes.dataset_repository import DatasetEntry, DatasetRecord
+
+        record = DatasetRecord(
+            dataset_name="dataset_A",
+            version="1.0",
+            base_model="Flux.2 Klein 9B",
+            lora_name="model_A",
+            language="zh",
+            trigger_words=["越野风格CMF设计"],
+            entries=[DatasetEntry("0001", "座椅麂皮，门板织物")],
+            source_path=Path("dataset.json"),
+            metadata={"style_id": "offroad", "trigger_words": ["越野风格CMF设计"]},
+        )
+        request = {
+            "style_id": "offroad",
+            "scope": "full_cabin",
+            "colors": [
+                {"family": "orange", "hex": "#c96f3a", "role": "primary"},
+                {"family": "gray", "hex": "#2f3f49", "role": "secondary"},
+            ],
+            "materials": ["suede", "fabric"],
+            "preserve_geometry": True,
+            "auxiliary_color_strategy": "style",
+            "material_policy": "strict",
+            "trigger_mode": "inline",
+            "deterministic": True,
+        }
+        kwargs = {
+            "user_prompt": "",
+            "cmf_request_json": json.dumps(request, ensure_ascii=False),
+            "dataset_name": "dataset_A",
+            "backend": "Ollama",
+            "model_override": "qwen3.5:122b",
+            "base_url_override": "",
+            "retrieval_seed": 1,
+            "generation_seed": 1,
+            "exploration_strength": "Strong",
+            "variation_seed": 1,
+            "top_k": 1,
+            "preserve_reference_color": False,
+            "custom_instruction": "",
+            "max_tokens": 128,
+            "temperature": 0.8,
+            "top_p": 1.0,
+            "repetition_penalty": 1.05,
+            "timeout_seconds": 10,
+        }
+        with patch.object(module, "_selected_record", return_value=record), patch.object(
+            module, "dataset_fingerprint", return_value="fingerprint"
+        ), patch.object(module, "get_dataset_index", return_value=DatasetIndex(record, "fingerprint")), patch.object(
+            module,
+            "generate_with_backend",
+            return_value='{"assignments":[{"component":"门板","color_family":"gray","material":"suede"}]}',
+        ) as generate:
+            result = module.DatasetRAGPromptGeneratorNode().generate_prompt(**kwargs)
+        self.assertTrue(result[0].startswith("由原状态转变为越野风格CMF设计"))
+        self.assertIn("橙色系（橙色，#c96f3a，RGB(201,111,58)）", result[0])
+        self.assertIn("灰色系（深灰，#2f3f49，RGB(47,63,73)）", result[0])
+        self.assertIn("棕色系（低饱和棕色，#7a4b2f，RGB(122,75,47)）", result[0])
+        self.assertIn("黑色系（深中性灰黑，#111820，RGB(17,24,32)）", result[0])
+        self.assertIn("门板内衬肌理使用灰色系", result[0])
+        debug = json.loads(result[2])
+        self.assertTrue(debug["cmf_validation"]["valid"])
+        self.assertEqual(debug["auxiliary_color_strategy"], "style")
+        self.assertEqual(
+            [item["family"] for item in debug["auxiliary_colors"]],
+            ["brown", "black"],
+        )
+        self.assertIn('"family":"brown"', generate.call_args.kwargs["prompt"])
+        self.assertEqual(debug["effective_temperature"], 0.0)
+        self.assertEqual(generate.call_args.kwargs["temperature"], 0.0)
 
     def test_generator_rejects_empty_backend_output(self):
         import py.nodes.qwen35_dataset_rag_nodes as module
@@ -788,7 +1381,7 @@ class NodeBehaviorTests(unittest.TestCase):
         import py.nodes.qwen35_dataset_rag_nodes as module
 
         generator = module.DatasetRAGPromptGeneratorNode()
-        with self.assertRaisesRegex(RuntimeError, "user_prompt is required"):
+        with self.assertRaisesRegex(RuntimeError, "user_prompt or cmf_request_json is required"):
             generator.generate_prompt(
                 "", "dataset_A", "Ollama", "", "", 1, 1, 4, False, "", 128, 0.0, 1.0, 1.05, 10
             )
